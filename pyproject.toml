@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ember-mcp"
+version = "0.1.0"
+description = "Persistent partitioned memory for LLMs via MCP — powered by Voronoi cell partitioning"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+authors = [
+    {name = "Timo Labs"},
+]
+keywords = ["mcp", "llm", "memory", "voronoi", "embeddings", "claude"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "mcp>=1.0.0",
+    "sentence-transformers>=2.2.2",
+    "faiss-cpu>=1.7.4",
+    "numpy>=1.24.0",
+    "pydantic>=2.0.0",
+    "aiosqlite>=0.19.0",
+    "aiofiles>=23.0.0",
+]
+
+[project.scripts]
+ember-mcp = "ember.cli:main"
+
+[project.urls]
+Homepage = "https://ember.timolabs.dev"
+Repository = "https://github.com/TimoLabsAI/ember-mcp"
+Issues = "https://github.com/TimoLabsAI/ember-mcp/issues"
+
+[tool.setuptools.packages.find]
+include = ["ember*"]

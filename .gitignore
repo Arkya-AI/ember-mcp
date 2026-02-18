@@ -1,0 +1,34 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+.env
+.venv
+env/
+venv/
+
+# Project-specific (not part of the package)
+docs/
+templates/
+output/
+.claude/
+
+# Website directories (not part of the Python package)
+ember-website/
+website/
+
+# Internal files
+Shadow-Decay-Paper.docx
+generate_paper.py
+AGENTS.md
+CLAUDE.md
+
+# User-specific MCP config
+.mcp.json
+
+# OS
+.DS_Store
+Thumbs.db
