@@ -97,8 +97,10 @@ async def _fetch_and_rerank(
     1. Embed query
     2. Broad FAISS search: k = top_k * fetch_multiplier candidates
     3. Compute topic vitality V(q,t) via radius search
-    4. For each candidate: compute HESTIA score using cached shadow_load
-    5. Sort by HESTIA score, return top_k as list of (ember, score, breakdown)
+    4. Batch-load all candidate + radius embers concurrently (get_embers_batch)
+    5. For each candidate: compute HESTIA score using cached shadow_load
+    6. Sort by HESTIA score, return top_k as list of (ember, score, breakdown)
+    7. Flush access-count updates concurrently after scoring (deferred write-back)
     """
     now = datetime.now(timezone.utc)
     config = load_config()
@@ -117,12 +119,27 @@ async def _fetch_and_rerank(
     radius_l2 = VectorEngine.cosine_to_l2(1.0 - config.topic_radius)
     radius_results = _engine.search_radius(vector, radius_l2)
 
+    # --- Batch load all embers needed (candidates + radius neighbors) ---
+    candidate_uuids = [
+        _storage.int_to_uuid[fid]
+        for fid, _ in results
+        if fid in _storage.int_to_uuid
+    ]
+    radius_uuids = [
+        _storage.int_to_uuid[fid]
+        for fid, _ in radius_results
+        if fid in _storage.int_to_uuid
+    ]
+    all_uuids = list(dict.fromkeys(candidate_uuids + radius_uuids))  # dedup, preserve order
+    ember_cache = await _storage.get_embers_batch(all_uuids)
+
+    # Build vitality inputs from batch cache
     neighbor_times = []
     neighbor_dists = []
     for faiss_id, dist_sq in radius_results:
         uuid = _storage.int_to_uuid.get(faiss_id)
         if uuid:
-            ember = await _storage.get_ember(uuid)
+            ember = ember_cache.get(uuid)
             if ember:
                 neighbor_times.append(ember.created_at)
                 neighbor_dists.append(dist_sq)
@@ -131,15 +148,16 @@ async def _fetch_and_rerank(
         neighbor_dists, neighbor_times, now, radius_l2, config.vitality_lambda
     )
 
-    # Score each candidate with HESTIA
+    # Score each candidate with HESTIA (all embers already in cache)
     scored = []
     v_max = max(vitality, 0.001)  # prevent division by zero
+    to_update: list[Ember] = []
 
     for faiss_id, dist in results:
         uuid = _storage.int_to_uuid.get(faiss_id)
         if not uuid:
             continue
-        ember = await _storage.get_ember(uuid)
+        ember = ember_cache.get(uuid)
         if not ember:
             continue
 
@@ -153,14 +171,19 @@ async def _fetch_and_rerank(
             config.nostalgia_alpha,
         )
 
-        # Update access stats
+        # Stage access-count update (deferred — flushed concurrently after scoring)
         ember.last_accessed_at = now
         ember.access_count += 1
-        await _storage.update_ember(ember)
+        to_update.append(ember)
 
         scored.append((ember, score, breakdown))
 
     scored.sort(key=lambda x: x[1], reverse=True)
+
+    # Flush all access-count updates concurrently (deferred write-back)
+    if to_update:
+        await asyncio.gather(*(_storage.update_ember(e) for e in to_update))
+
     return scored[:top_k]
 
 

@@ -204,6 +204,26 @@ class StorageManager:
             logger.error(f"Failed to decode ember {ember_id}: {e}")
             return None
 
+    async def get_embers_batch(self, ember_ids: List[str]) -> Dict[str, Ember]:
+        """
+        Load multiple embers concurrently using asyncio.gather().
+
+        Replaces sequential get_ember() loops — reduces N serial I/O hits
+        to a single concurrent gather. Semaphore(20) prevents fd exhaustion.
+
+        Returns:
+            Dict mapping ember_id -> Ember for all successfully loaded embers.
+            Missing or corrupt embers are silently omitted.
+        """
+        sem = asyncio.Semaphore(20)
+
+        async def _load_one(eid: str) -> tuple[str, Optional[Ember]]:
+            async with sem:
+                return eid, await self.get_ember(eid)
+
+        results = await asyncio.gather(*(_load_one(eid) for eid in ember_ids))
+        return {eid: ember for eid, ember in results if ember is not None}
+
     async def delete_ember(self, ember_id: str) -> Optional[int]:
         """
         Delete an ember file and remove it from the ID map.
@@ -347,6 +367,61 @@ class StorageManager:
                 neighbors.add(edge["target_id"])
         return list(neighbors)
 
+    async def get_neighbors_batch(
+        self, ember_ids: List[str], edge_types: Optional[List[str]] = None
+    ) -> Dict[str, Set[str]]:
+        """
+        Fetch neighbors for multiple nodes in a single SQL query.
+
+        Replaces N sequential get_neighbors() calls with one IN (...) query
+        per BFS frontier level. Reduces BFS from O(V) queries to O(depth) queries.
+
+        SQLite IN clause limit is 999 params — chunks automatically if needed.
+
+        Returns:
+            Dict mapping ember_id -> set of neighbor ember_ids.
+        """
+        if not ember_ids:
+            return {}
+
+        result: Dict[str, Set[str]] = {eid: set() for eid in ember_ids}
+
+        # Chunk to respect SQLite's 999-parameter limit
+        chunk_size = 900
+        id_chunks = [ember_ids[i:i + chunk_size] for i in range(0, len(ember_ids), chunk_size)]
+
+        async with self._db_lock:
+            async with aiosqlite.connect(self.db_path) as db:
+                for chunk in id_chunks:
+                    placeholders = ",".join("?" * len(chunk))
+
+                    if edge_types:
+                        et_placeholders = ",".join("?" * len(edge_types))
+                        query = f"""
+                            SELECT source_id, target_id FROM edges
+                            WHERE (source_id IN ({placeholders}) OR target_id IN ({placeholders}))
+                            AND edge_type IN ({et_placeholders})
+                        """
+                        params = chunk + chunk + edge_types
+                    else:
+                        query = f"""
+                            SELECT source_id, target_id FROM edges
+                            WHERE source_id IN ({placeholders}) OR target_id IN ({placeholders})
+                        """
+                        params = chunk + chunk
+
+                    cursor = await db.execute(query, params)
+                    rows = await cursor.fetchall()
+
+                    ember_id_set = set(chunk)
+                    for src, tgt in rows:
+                        if src in ember_id_set:
+                            result[src].add(tgt)
+                        if tgt in ember_id_set:
+                            result[tgt].add(src)
+
+        return result
+
     async def traverse_kg(
         self,
         start_id: str,
@@ -354,36 +429,32 @@ class StorageManager:
         edge_types: Optional[List[str]] = None,
     ) -> Set[str]:
         """
-        BFS traversal from start_id up to `depth` hops.
+        Level-by-level BFS traversal from start_id up to `depth` hops.
+
+        Uses get_neighbors_batch() to fetch all frontier neighbors in a single
+        SQL query per depth level — O(depth) queries instead of O(V) queries.
 
         Returns set of ember_ids found (excluding start_id).
         """
-        visited: Set[str] = set()
-        queue: deque = deque()
-        queue.append((start_id, 0))
-        visited.add(start_id)
+        visited: Set[str] = {start_id}
+        frontier: List[str] = [start_id]
 
-        while queue:
-            current_id, current_depth = queue.popleft()
+        for _ in range(depth):
+            if not frontier:
+                break
 
-            if current_depth >= depth:
-                continue
+            # Fetch all neighbors for the entire current frontier in one query
+            neighbors_map = await self.get_neighbors_batch(frontier, edge_types)
 
-            # Get neighbors for each edge type or all types
-            if edge_types:
-                neighbors: Set[str] = set()
-                for et in edge_types:
-                    et_neighbors = await self.get_neighbors(current_id, et)
-                    neighbors.update(et_neighbors)
-            else:
-                neighbors = set(await self.get_neighbors(current_id))
+            next_frontier: List[str] = []
+            for neighbors in neighbors_map.values():
+                for neighbor_id in neighbors:
+                    if neighbor_id not in visited:
+                        visited.add(neighbor_id)
+                        next_frontier.append(neighbor_id)
 
-            for neighbor_id in neighbors:
-                if neighbor_id not in visited:
-                    visited.add(neighbor_id)
-                    queue.append((neighbor_id, current_depth + 1))
+            frontier = next_frontier
 
-        # Exclude start_id from results
         visited.discard(start_id)
         return visited
 
