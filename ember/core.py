@@ -1,4 +1,8 @@
+import asyncio
+import atexit
+import logging
 import math
+import os
 from pathlib import Path
 from typing import Optional, List, Tuple, Dict, TYPE_CHECKING
 
@@ -8,6 +12,8 @@ if TYPE_CHECKING:
     from sentence_transformers import SentenceTransformer
 
 from .models import EmberConfig
+
+logger = logging.getLogger(__name__)
 
 # Lazy imports — only loaded when first needed, not at module import time
 _np = None
@@ -28,6 +34,18 @@ def _get_faiss():
         import faiss as _f
         _faiss = _f
     return _faiss
+
+
+# Deferred import for filelock — only needed when VectorEngine is instantiated
+_filelock = None
+
+
+def _get_filelock():
+    global _filelock
+    if _filelock is None:
+        from filelock import FileLock
+        _filelock = FileLock
+    return _filelock
 
 
 class VectorEngine:
@@ -59,6 +77,24 @@ class VectorEngine:
         self._model_name = config.model_name
         self._centroid_index = None
         self._memory_index = None
+
+        # Async concurrency controls
+        self._embed_semaphore = asyncio.Semaphore(2)
+        self._mutation_lock = asyncio.Lock()
+
+        # Cross-process file lock for vectors.faiss
+        FileLock = _get_filelock()
+        self._index_file_lock = FileLock(str(self.index_path) + ".lock")
+
+        # mtime-based stale detection for cross-process consistency
+        self._index_mtime: float = 0.0
+
+        # Write batching: defer index writes to reduce I/O contention
+        self._index_dirty: bool = False
+        self._flush_task: Optional[asyncio.Task] = None
+
+        # Register synchronous shutdown handler
+        atexit.register(self._save_index_sync)
 
     @property
     def centroid_index(self):
@@ -118,6 +154,7 @@ class VectorEngine:
         if self.index_path.exists():
             try:
                 index = faiss.read_index(str(self.index_path))
+                self._index_mtime = os.path.getmtime(self.index_path)
                 return index
             except Exception as e:
                 raise RuntimeError(f"Failed to load FAISS index from {self.index_path}: {e}")
@@ -127,13 +164,26 @@ class VectorEngine:
         index = faiss.IndexIDMap(quantizer)
         return index
 
-    def embed(self, text: str):
+    # ------------------------------------------------------------------
+    # Embedding (async, thread-pooled, semaphore-limited)
+    # ------------------------------------------------------------------
+
+    async def embed(self, text: str):
         """
-        Encode text into a normalized vector.
+        Encode text into a normalized vector (async).
+
+        The full pipeline (model.encode → normalize) runs in a thread pool
+        to avoid blocking the async event loop. A semaphore limits concurrent
+        encodings to prevent CPU thrashing.
 
         Returns:
             np.ndarray: Shape (1, dim) float32 array.
         """
+        async with self._embed_semaphore:
+            return await asyncio.to_thread(self._embed_sync, text)
+
+    def _embed_sync(self, text: str):
+        """Synchronous embedding pipeline — runs in thread pool."""
         np = _get_np()
         faiss = _get_faiss()
         vector = self.model.encode(text)
@@ -164,9 +214,14 @@ class VectorEngine:
         _, I = self.centroid_index.search(vector, 1)
         return int(I[0][0])
 
-    def add_vector(self, faiss_id: int, vector) -> None:
+    # ------------------------------------------------------------------
+    # Index mutations (async, locked, write-batched)
+    # ------------------------------------------------------------------
+
+    async def add_vector(self, faiss_id: int, vector) -> None:
         """
-        Add a vector to the memory index with a specific ID and persist changes.
+        Add a vector to the memory index with a specific ID.
+        Uses mutation lock for thread safety + deferred flush for batching.
         """
         np = _get_np()
         ids_array = np.array([faiss_id], dtype=np.int64)
@@ -174,17 +229,39 @@ class VectorEngine:
         if vector.ndim == 1:
             vector = vector.reshape(1, -1)
 
-        self.memory_index.add_with_ids(vector, ids_array)
-        self.save_index()
+        async with self._mutation_lock:
+            self.memory_index.add_with_ids(vector, ids_array)
+            self._index_dirty = True
+            self._schedule_flush()
 
-    def remove_vector(self, faiss_id: int) -> None:
+    async def remove_vector(self, faiss_id: int) -> None:
         """
-        Remove a vector from the memory index by ID and persist changes.
+        Remove a vector from the memory index by ID.
+        Uses mutation lock for thread safety + deferred flush for batching.
         """
         np = _get_np()
         ids_array = np.array([faiss_id], dtype=np.int64)
-        self.memory_index.remove_ids(ids_array)
-        self.save_index()
+
+        async with self._mutation_lock:
+            self.memory_index.remove_ids(ids_array)
+            self._index_dirty = True
+            self._schedule_flush()
+
+    # ------------------------------------------------------------------
+    # Search (with cross-process freshness check)
+    # ------------------------------------------------------------------
+
+    def _check_index_freshness(self) -> None:
+        """Reload index from disk if another process has written a newer version."""
+        if not self.index_path.exists():
+            return
+        try:
+            disk_mtime = os.path.getmtime(self.index_path)
+            if disk_mtime > self._index_mtime:
+                self._memory_index = self._load_or_create_memory_index()
+                self._index_mtime = disk_mtime
+        except OSError:
+            pass
 
     def search(self, query_vector, top_k: int = 5) -> List[Tuple[int, float]]:
         """
@@ -193,8 +270,13 @@ class VectorEngine:
         Returns:
             List of (faiss_id, l2_squared_distance) tuples.
         """
+        self._check_index_freshness()
+
         if self.memory_index.ntotal == 0:
             return []
+
+        if query_vector.ndim == 1:
+            query_vector = query_vector.reshape(1, -1)
 
         k = min(top_k, self.memory_index.ntotal)
         distances, indices = self.memory_index.search(query_vector, k)
@@ -217,8 +299,13 @@ class VectorEngine:
         Returns:
             List of (faiss_id, l2_squared_distance) tuples.
         """
+        self._check_index_freshness()
+
         if self.memory_index.ntotal == 0:
             return []
+
+        if query_vector.ndim == 1:
+            query_vector = query_vector.reshape(1, -1)
 
         # FAISS range_search expects squared L2 distance as threshold
         threshold = radius_l2 * radius_l2
@@ -249,14 +336,62 @@ class VectorEngine:
         except RuntimeError:
             return None
 
-    def save_index(self) -> None:
-        """Persist the memory index to disk."""
+    # ------------------------------------------------------------------
+    # Index persistence (async with cross-process file lock + batching)
+    # ------------------------------------------------------------------
+
+    async def save_index(self) -> None:
+        """Persist the memory index to disk with cross-process locking."""
         faiss = _get_faiss()
-        faiss.write_index(self.memory_index, str(self.index_path))
+        with self._index_file_lock:
+            await asyncio.to_thread(faiss.write_index, self.memory_index, str(self.index_path))
+        self._index_mtime = os.path.getmtime(self.index_path)
+        self._index_dirty = False
+
+    def _save_index_sync(self) -> None:
+        """Synchronous index save for atexit shutdown handler."""
+        if not self._index_dirty:
+            return
+        try:
+            faiss = _get_faiss()
+            with self._index_file_lock:
+                faiss.write_index(self.memory_index, str(self.index_path))
+            self._index_dirty = False
+            logger.info("Index flushed on shutdown.")
+        except Exception as e:
+            logger.error(f"Failed to flush index on shutdown: {e}")
+
+    def _schedule_flush(self) -> None:
+        """Schedule a background flush if not already pending."""
+        if self._flush_task is None or self._flush_task.done():
+            try:
+                loop = asyncio.get_running_loop()
+                self._flush_task = loop.create_task(self._deferred_flush())
+            except RuntimeError:
+                pass  # No running loop (e.g., during testing)
+
+    async def _deferred_flush(self) -> None:
+        """Wait briefly then flush dirty index to disk."""
+        await asyncio.sleep(2.0)
+        if self._index_dirty:
+            async with self._mutation_lock:
+                await self.save_index()
+
+    async def flush_index(self) -> None:
+        """Force immediate flush of dirty index. Call on shutdown."""
+        if self._index_dirty:
+            async with self._mutation_lock:
+                await self.save_index()
 
     def reload_index(self) -> None:
         """Reload the memory index from disk. Picks up writes from other processes."""
         self._memory_index = self._load_or_create_memory_index()
+        if self.index_path.exists():
+            self._index_mtime = os.path.getmtime(self.index_path)
+
+    # ------------------------------------------------------------------
+    # Utilities (unchanged)
+    # ------------------------------------------------------------------
 
     def get_centroids(self):
         """

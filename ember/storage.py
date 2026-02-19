@@ -9,6 +9,7 @@ from typing import Optional, List, Dict, Set
 
 import aiofiles
 import aiosqlite
+from filelock import FileLock
 
 from ember.models import Ember, EmberConfig, RegionStats
 
@@ -41,6 +42,9 @@ class StorageManager:
         # Concurrency locks
         self._map_lock = asyncio.Lock()
         self._db_lock = asyncio.Lock()
+
+        # Cross-process file lock for id_map.json
+        self._id_map_file_lock = FileLock(str(self.id_map_path) + ".lock")
 
     async def init_db(self):
         """Initialize storage directories, SQLite database, and load ID maps."""
@@ -134,11 +138,12 @@ class StorageManager:
                 self.next_int_id = 0
 
     async def _save_id_map(self):
-        """Persist the ID mapping to disk."""
+        """Persist the ID mapping to disk with cross-process locking."""
         try:
             data = {str(k): v for k, v in self.int_to_uuid.items()}
-            async with aiofiles.open(self.id_map_path, mode="w") as f:
-                await f.write(json.dumps(data, indent=2))
+            with self._id_map_file_lock:
+                async with aiofiles.open(self.id_map_path, mode="w") as f:
+                    await f.write(json.dumps(data, indent=2))
         except Exception as e:
             logger.error(f"Failed to save ID map: {e}")
             raise

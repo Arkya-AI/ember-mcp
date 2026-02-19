@@ -1,5 +1,6 @@
 import asyncio
 import os
+import signal
 from datetime import datetime, timezone
 from typing import Optional, List
 
@@ -64,6 +65,17 @@ async def _reload_from_disk():
     await _storage.reload_id_map()
 
 
+def _shutdown_handler(signum, frame):
+    """Flush dirty index and release locks on SIGTERM/SIGINT."""
+    if _engine is not None:
+        _engine._save_index_sync()
+
+
+# Register signal handlers for graceful shutdown
+signal.signal(signal.SIGTERM, _shutdown_handler)
+signal.signal(signal.SIGINT, _shutdown_handler)
+
+
 # ---------------------------------------------------------------------------
 # Helpers: Preview + Fetch-and-Rerank + Shadow-on-Insert
 # ---------------------------------------------------------------------------
@@ -91,7 +103,7 @@ async def _fetch_and_rerank(
     now = datetime.now(timezone.utc)
     config = load_config()
 
-    vector = _engine.embed(query_text)
+    vector = await _engine.embed(query_text)
     total = _engine.memory_index.ntotal
     fetch_k = min(top_k * fetch_multiplier, total) if total > 0 else 0
     if fetch_k == 0:
@@ -156,6 +168,10 @@ async def _shadow_on_insert(new_ember: Ember, vector: np.ndarray) -> None:
     """Shadow-on-Insert: update shadow_load on existing neighbors bidirectionally."""
     config = load_config()
 
+    # Ensure vector is 2D (1, dim) for FAISS compatibility
+    if vector.ndim == 1:
+        vector = vector.reshape(1, -1)
+
     results = _engine.search(vector, top_k=config.shadow_k)
     if not results:
         return
@@ -219,7 +235,7 @@ async def _shadow_on_insert(new_ember: Ember, vector: np.ndarray) -> None:
 # ---------------------------------------------------------------------------
 
 
-@mcp.tool()
+@mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": False, "openWorldHint": False})
 async def ember_store(
     name: str,
     content: str,
@@ -247,7 +263,7 @@ async def ember_store(
     if importance not in valid_importance:
         importance = "context"
 
-    vector = _engine.embed(content)
+    vector = await _engine.embed(content)
     cell_id = _engine.assign_cell(vector)
 
     ember = Ember(
@@ -261,7 +277,7 @@ async def ember_store(
     )
 
     faiss_id = await _storage.save_ember(ember)
-    _engine.add_vector(faiss_id, vector)
+    await _engine.add_vector(faiss_id, vector)
 
     await _shadow_on_insert(ember, vector.flatten())
 
@@ -272,7 +288,7 @@ async def ember_store(
     )
 
 
-@mcp.tool()
+@mcp.tool(annotations={"readOnlyHint": True, "destructiveHint": False, "openWorldHint": False})
 async def ember_recall(query: str, top_k: int = 5) -> str:
     """
     Retrieve memory embers semantically similar to the query, ranked by HESTIA score.
@@ -306,7 +322,7 @@ async def ember_recall(query: str, top_k: int = 5) -> str:
     return "\n\n".join(lines)
 
 
-@mcp.tool()
+@mcp.tool(annotations={"readOnlyHint": True, "destructiveHint": False, "openWorldHint": False})
 async def ember_deep_recall(query: str, top_k: int = 3) -> str:
     """
     Retrieve memory embers AND read their source files for full context.
@@ -367,7 +383,7 @@ async def ember_deep_recall(query: str, top_k: int = 3) -> str:
     return output
 
 
-@mcp.tool()
+@mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": False, "openWorldHint": False})
 async def ember_learn(conversation_context: str, source_path: str = "") -> str:
     """
     Auto-capture key information from conversation. Extracts facts, preferences,
@@ -401,7 +417,7 @@ async def ember_learn(conversation_context: str, source_path: str = "") -> str:
     if len(content) > 60:
         name = name.rsplit(" ", 1)[0] + "..."
 
-    vector = _engine.embed(content)
+    vector = await _engine.embed(content)
     cell_id = _engine.assign_cell(vector)
 
     # Check for near-duplicates
@@ -428,14 +444,14 @@ async def ember_learn(conversation_context: str, source_path: str = "") -> str:
     )
 
     faiss_id = await _storage.save_ember(ember)
-    _engine.add_vector(faiss_id, vector)
+    await _engine.add_vector(faiss_id, vector)
 
     await _shadow_on_insert(ember, vector.flatten())
 
     return f"Captured {importance}: '{name}'"
 
 
-@mcp.tool()
+@mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": True, "openWorldHint": False})
 async def ember_contradict(ember_id: str, new_content: str, reason: str = "") -> str:
     """
     Mark an existing memory as stale and store an updated version.
@@ -458,7 +474,7 @@ async def ember_contradict(ember_id: str, new_content: str, reason: str = "") ->
     old_ember.shadow_load = 1.0
 
     # Store new version with supersedes link
-    vector = _engine.embed(new_content)
+    vector = await _engine.embed(new_content)
     cell_id = _engine.assign_cell(vector)
 
     new_ember = Ember(
@@ -478,7 +494,7 @@ async def ember_contradict(ember_id: str, new_content: str, reason: str = "") ->
 
     await _storage.update_ember(old_ember)
     faiss_id = await _storage.save_ember(new_ember)
-    _engine.add_vector(faiss_id, vector)
+    await _engine.add_vector(faiss_id, vector)
 
     # Create supersedes edge
     await _storage.save_edge(ember_id, new_ember.ember_id, "supersedes", 1.0)
@@ -492,7 +508,7 @@ async def ember_contradict(ember_id: str, new_content: str, reason: str = "") ->
     )
 
 
-@mcp.tool()
+@mcp.tool(annotations={"readOnlyHint": True, "destructiveHint": False, "openWorldHint": False})
 async def ember_list(tag: str = "", limit: int = 20, offset: int = 0) -> str:
     """List stored memory embers with pagination. Returns metadata only (no content).
 
@@ -534,7 +550,7 @@ async def ember_list(tag: str = "", limit: int = 20, offset: int = 0) -> str:
     return header + "\n" + "\n".join(lines)
 
 
-@mcp.tool()
+@mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": True, "openWorldHint": False})
 async def ember_delete(ember_id: str) -> str:
     """Delete a memory ember by its ID (UUID)."""
     await _ensure_init()
@@ -544,14 +560,14 @@ async def ember_delete(ember_id: str) -> str:
         return f"Ember {ember_id} not found."
 
     try:
-        _engine.remove_vector(faiss_id)
+        await _engine.remove_vector(faiss_id)
     except Exception:
         pass
 
     return f"Ember {ember_id} deleted."
 
 
-@mcp.tool()
+@mcp.tool(annotations={"readOnlyHint": True, "destructiveHint": False, "openWorldHint": False})
 async def ember_inspect(cell_id: int = -1) -> str:
     """Inspect Voronoi cell health. Shows ember distribution and conflict density."""
     await _ensure_init()
@@ -585,7 +601,7 @@ async def ember_inspect(cell_id: int = -1) -> str:
     return "\n".join(lines)
 
 
-@mcp.tool()
+@mcp.tool(annotations={"readOnlyHint": True, "destructiveHint": False, "openWorldHint": False})
 async def ember_auto(conversation_context: str) -> str:
     """
     Automatically retrieve relevant memory embers based on conversation context.
@@ -617,7 +633,7 @@ async def ember_auto(conversation_context: str) -> str:
     return "\n\n".join(lines)
 
 
-@mcp.tool()
+@mcp.tool(annotations={"readOnlyHint": True, "destructiveHint": False, "openWorldHint": False})
 async def ember_read(ember_id: str) -> str:
     """
     Read the full content of a specific ember by ID.
@@ -641,7 +657,7 @@ async def ember_read(ember_id: str) -> str:
     )
 
 
-@mcp.tool()
+@mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": False, "openWorldHint": False})
 async def ember_save_session(
     summary: str,
     decisions: str = "",
@@ -664,7 +680,7 @@ async def ember_save_session(
     resolved_source = source_path if source_path else None
 
     async def _store_session_ember(name, content, tags, importance):
-        vector = _engine.embed(content)
+        vector = await _engine.embed(content)
         cell_id = _engine.assign_cell(vector)
         ember = Ember(
             name=name,
@@ -676,7 +692,7 @@ async def ember_save_session(
             source_path=resolved_source,
         )
         faiss_id = await _storage.save_ember(ember)
-        _engine.add_vector(faiss_id, vector)
+        await _engine.add_vector(faiss_id, vector)
         await _shadow_on_insert(ember, vector.flatten())
 
     if summary:
@@ -703,7 +719,7 @@ async def ember_save_session(
 # ---------------------------------------------------------------------------
 
 
-@mcp.tool()
+@mcp.tool(annotations={"readOnlyHint": True, "destructiveHint": False, "openWorldHint": False})
 async def ember_drift_check() -> str:
     """
     Analyze knowledge region health using Shadow-Decay conflict density.
@@ -756,7 +772,7 @@ async def ember_drift_check() -> str:
     return "\n".join(lines)
 
 
-@mcp.tool()
+@mcp.tool(annotations={"readOnlyHint": True, "destructiveHint": False, "openWorldHint": False})
 async def ember_graph_search(query: str, depth: int = 2, top_k: int = 5) -> str:
     """
     Vector search → entry node → BFS via knowledge graph edges → return correlated context.
@@ -811,7 +827,7 @@ async def ember_graph_search(query: str, depth: int = 2, top_k: int = 5) -> str:
     return "\n".join(lines)
 
 
-@mcp.tool()
+@mcp.tool(annotations={"readOnlyHint": True, "destructiveHint": False, "openWorldHint": False})
 async def ember_health() -> str:
     """
     Compute hallucination risk across all embers, log to metrics, return health report with trend.
@@ -860,7 +876,7 @@ async def ember_health() -> str:
     )
 
 
-@mcp.tool()
+@mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": False, "openWorldHint": False})
 async def ember_recompute_shadows() -> str:
     """
     Full recalculation of shadow_load for every ember.
@@ -941,7 +957,7 @@ async def ember_recompute_shadows() -> str:
     return f"Recomputed shadows for {len(embers)} embers. {updated} updated."
 
 
-@mcp.tool()
+@mcp.tool(annotations={"readOnlyHint": True, "destructiveHint": False, "openWorldHint": False})
 async def ember_explain(ember_id: str) -> str:
     """
     Return HESTIA score breakdown for a specific ember:
