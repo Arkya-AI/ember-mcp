@@ -1,4 +1,4 @@
-# Ember MCP — Gives You Claude and Codex Local Temporal Persistent Memory And Reduced Hallucinations
+# Ember MCP — Gives Your Claude and Codex Local Temporal Persistent Memory And Reduced Hallucinations
 
 **Local-first memory server for LLMs that uses Voronoi partitioning to manage context and prevent hallucinations caused by stale data.** Stop re-explaining your stack every time you open a new chat window — Ember gives your AI a permanent memory that follows you from Claude to Cursor, automatically discarding outdated decisions so you never get code based on the architecture you abandoned last month.
 
