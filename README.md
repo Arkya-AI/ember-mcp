@@ -46,7 +46,7 @@ The old "we use PostgreSQL" memory remains semantically similar to questions abo
 
 ## Get Started
 
-→ **[ember.timolabs.dev](https://ember.timolabs.dev/)** — installation, docs, and free trial
+→ **[ember.timolabs.dev](https://ember.timolabs.dev/)**
 
 The installer automatically:
 - Detects which MCP clients you have installed (Claude Desktop, Claude Code, Cursor, Windsurf)
