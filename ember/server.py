@@ -1,7 +1,9 @@
 import asyncio
+import logging
 import os
 import signal
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Optional, List
 
 import aiofiles
@@ -40,7 +42,9 @@ mcp = FastMCP(
         "silently. Never announce memory operations. Never mention internal mechanics "
         "(vectors, scores, cells). Use recalled memories naturally. When correcting "
         "old info, use ember_contradict. For source file detail, use ember_deep_recall. "
-        "Use ember_read to get full content of a specific memory."
+        "Use ember_read to get full content of a specific memory. "
+        "Use ember_compact to identify and compress stale memories. "
+        "Use ember_actionable to view task items, ember_set_status to update them."
     ),
 )
 
@@ -265,6 +269,8 @@ async def ember_store(
     tags: str = "",
     importance: str = "context",
     source_path: str = "",
+    status: str = "",
+    edges: str = "",
 ) -> str:
     """
     Store a memory ember with importance level. The content will be embedded and assigned
@@ -277,6 +283,10 @@ async def ember_store(
         importance: One of: fact, decision, preference, context, learning
         source_path: Optional path to the source file this info came from.
             Enables deep recall to read the full source for richer context.
+        status: Optional task status: open, in_progress, done, or empty for no status.
+        edges: Optional edges to create. Format: "type:ember_id,type:ember_id"
+            Valid types: depends_on, child_of, context_for
+            Example: "depends_on:abc123,context_for:def456"
     """
     await _ensure_init()
 
@@ -284,7 +294,12 @@ async def ember_store(
 
     valid_importance = ["fact", "decision", "preference", "context", "learning"]
     if importance not in valid_importance:
-        importance = "context"
+        return f"Error: invalid importance '{importance}'. Valid values: {', '.join(valid_importance)}."
+
+    valid_statuses = ["open", "in_progress", "done"]
+    if status and status not in valid_statuses:
+        return f"Error: invalid status '{status}'. Valid values: {', '.join(valid_statuses)}, or empty for no status."
+    resolved_status = status if status in valid_statuses else None
 
     vector = await _engine.embed(content)
     cell_id = _engine.assign_cell(vector)
@@ -297,6 +312,7 @@ async def ember_store(
         importance=importance,
         source="manual",
         source_path=source_path if source_path else None,
+        status=resolved_status,
     )
 
     faiss_id = await _storage.save_ember(ember)
@@ -304,10 +320,28 @@ async def ember_store(
 
     await _shadow_on_insert(ember, vector.flatten())
 
+    # Process user-specified typed edges
+    if edges:
+        from ember.models import USER_EDGE_TYPES
+        for edge_spec in edges.split(","):
+            edge_spec = edge_spec.strip()
+            if ":" not in edge_spec:
+                continue
+            edge_type, target_id = edge_spec.split(":", 1)
+            edge_type = edge_type.strip()
+            target_id = target_id.strip()
+            if edge_type in USER_EDGE_TYPES:
+                target = await _storage.get_ember(target_id)
+                if target:
+                    await _storage.save_edge(
+                        ember.ember_id, target_id, edge_type, 0.0
+                    )
+
     half_life = DECAY_HALF_LIVES.get(importance, 30.0)
+    status_note = f" Status: {resolved_status}." if resolved_status else ""
     return (
         f"Stored ember '{name}' (ID: {ember.ember_id}) in Cell {cell_id}. "
-        f"Importance: {importance} (half-life: {int(half_life)}d)"
+        f"Importance: {importance} (half-life: {int(half_life)}d){status_note}"
     )
 
 
@@ -386,7 +420,17 @@ async def ember_deep_recall(query: str, top_k: int = 3) -> str:
             and ember.source_path not in source_contents
             and len(source_contents) < MAX_SOURCE_FILES
         ):
-            if os.path.isfile(ember.source_path):
+            # Security: only read files within the user's home directory
+            try:
+                safe_root = Path.home().resolve()
+                resolved = Path(ember.source_path).expanduser().resolve()
+                path_is_safe = str(resolved).startswith(str(safe_root))
+            except Exception:
+                path_is_safe = False
+
+            if not path_is_safe:
+                source_contents[ember.source_path] = "[Skipped: path outside home directory]"
+            elif os.path.isfile(ember.source_path):
                 try:
                     async with aiofiles.open(ember.source_path, mode="r") as f:
                         raw = await f.read()
@@ -584,8 +628,8 @@ async def ember_delete(ember_id: str) -> str:
 
     try:
         await _engine.remove_vector(faiss_id)
-    except Exception:
-        pass
+    except Exception as e:
+        logging.warning("FAISS remove_vector failed for ember %s (faiss_id=%s): %s", ember_id, faiss_id, e)
 
     return f"Ember {ember_id} deleted."
 
@@ -634,10 +678,33 @@ async def ember_auto(conversation_context: str) -> str:
     await _ensure_init()
     await _reload_from_disk()
 
-    scored = await _fetch_and_rerank(conversation_context, top_k=5)
+    # Over-fetch so session embers outside top-5 can be boosted in
+    scored = await _fetch_and_rerank(conversation_context, top_k=10)
 
     if not scored:
-        return ""
+        return "No embers found."
+
+    # --- Session Boost: prioritize recent session handoffs ---
+    now = datetime.now(timezone.utc)
+    session_embers = [
+        (e, s, bd) for e, s, bd in scored if e.source == "session"
+    ]
+    latest_session_time = None
+    if session_embers:
+        latest_session_time = max(e.created_at for e, _, _ in session_embers)
+
+    boosted = []
+    for ember, score, breakdown in scored:
+        boost = 1.0
+        if ember.source == "session":
+            boost = 1.5  # all session embers get 1.5x
+            if latest_session_time and ember.created_at == latest_session_time:
+                boost = 2.0  # most recent session gets 2.0x
+        boosted.append((ember, score * boost, breakdown))
+
+    boosted.sort(key=lambda x: x[1], reverse=True)
+    scored = boosted[:5]
+    # --- End Session Boost ---
 
     lines = []
     has_sources = False
@@ -796,7 +863,9 @@ async def ember_drift_check() -> str:
 
 
 @mcp.tool(annotations={"readOnlyHint": True, "destructiveHint": False, "openWorldHint": False})
-async def ember_graph_search(query: str, depth: int = 2, top_k: int = 5) -> str:
+async def ember_graph_search(
+    query: str, depth: int = 2, top_k: int = 5, edge_types: str = ""
+) -> str:
     """
     Vector search → entry node → BFS via knowledge graph edges → return correlated context.
 
@@ -804,9 +873,14 @@ async def ember_graph_search(query: str, depth: int = 2, top_k: int = 5) -> str:
         query: What to search for
         depth: How many hops to traverse (default 2)
         top_k: Max results to return (default 5)
+        edge_types: Optional filter. Comma-separated edge types to traverse.
+            Valid types: shadow, related, supersedes, depends_on, child_of, context_for
+            If empty, traverses all edge types.
     """
     await _ensure_init()
     await _reload_from_disk()
+
+    depth = min(depth, 5)
 
     # Find entry point via HESTIA
     entry_results = await _fetch_and_rerank(query, top_k=1)
@@ -816,8 +890,15 @@ async def ember_graph_search(query: str, depth: int = 2, top_k: int = 5) -> str:
     entry_ember, entry_score, _ = entry_results[0]
     entry_id = entry_ember.ember_id
 
+    # Parse edge type filter
+    type_filter = None
+    if edge_types:
+        type_filter = [t.strip() for t in edge_types.split(",") if t.strip()]
+
     # BFS traversal from entry point
-    connected_ids = await _storage.traverse_kg(entry_id, depth=depth)
+    connected_ids = await _storage.traverse_kg(
+        entry_id, depth=depth, edge_types=type_filter
+    )
 
     # Load discovered embers
     graph_embers = []
@@ -848,6 +929,199 @@ async def ember_graph_search(query: str, depth: int = 2, top_k: int = 5) -> str:
 
     lines.append("\n→ Use ember_read(id) for full content of any memory.")
     return "\n".join(lines)
+
+
+@mcp.tool(annotations={"readOnlyHint": True, "destructiveHint": False, "openWorldHint": False})
+async def ember_actionable(include_done: bool = False) -> str:
+    """
+    Return embers with an active status (open or in_progress).
+    Use this for lightweight task tracking and action item review.
+
+    Args:
+        include_done: If True, also show completed items. Default: False.
+    """
+    await _ensure_init()
+    await _reload_from_disk()
+
+    all_embers = await _storage.list_embers()
+    now = datetime.now(timezone.utc)
+
+    target_statuses = {"open", "in_progress"}
+    if include_done:
+        target_statuses.add("done")
+
+    actionable = [e for e in all_embers if e.status in target_statuses]
+
+    if not actionable:
+        return "No actionable items found."
+
+    # Sort: in_progress first, then open, then done. Within each, newest first.
+    status_order = {"in_progress": 0, "open": 1, "done": 2}
+    actionable.sort(
+        key=lambda e: (status_order.get(e.status, 9), -e.created_at.timestamp())
+    )
+
+    lines = [f"Actionable items ({len(actionable)}):\n"]
+    for e in actionable:
+        age_days = (now - e.created_at).total_seconds() / 86400.0
+        freshness = "today" if age_days < 1 else f"{int(age_days)}d ago"
+        status_icon = {
+            "open": "[  ]", "in_progress": "[>>]", "done": "[ok]"
+        }.get(e.status, "[??]")
+        lines.append(
+            f"{status_icon} {e.name} ({e.importance}, {freshness}) "
+            f"[id: {e.ember_id}]"
+        )
+
+    return "\n".join(lines)
+
+
+@mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": False, "openWorldHint": False})
+async def ember_set_status(ember_id: str, status: str) -> str:
+    """
+    Update the status of an existing ember. Use for task tracking.
+
+    Args:
+        ember_id: The ember to update.
+        status: New status: open, in_progress, done, or clear (removes status).
+    """
+    await _ensure_init()
+
+    ember = await _storage.get_ember(ember_id)
+    if not ember:
+        return f"Ember {ember_id} not found."
+
+    valid = ["open", "in_progress", "done", "clear"]
+    if status not in valid:
+        return f"Invalid status '{status}'. Use: {', '.join(valid)}"
+
+    ember.status = None if status == "clear" else status
+    ember.updated_at = datetime.now(timezone.utc)
+    await _storage.update_ember(ember)
+
+    display_status = "cleared" if status == "clear" else status
+    return f"Updated '{ember.name}' status to: {display_status}"
+
+
+@mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": False, "openWorldHint": False})
+async def ember_compact(
+    analyze: bool = True,
+    ember_id: str = "",
+    compacted_content: str = "",
+    min_shadow_load: float = 0.3,
+    min_age_days: float = 7.0,
+    limit: int = 10,
+) -> str:
+    """
+    AI-powered compaction of stale/shadowed embers. Two modes:
+
+    1. Analyze mode (analyze=True, default): Identifies compaction candidates
+       based on shadow_load, age, and HESTIA score. Returns candidates with
+       their full content for the LLM to summarize.
+
+    2. Execute mode (analyze=False, ember_id + compacted_content required):
+       Replaces an ember's content with the LLM-generated summary. Re-embeds
+       the vector, preserves all graph edges and metadata.
+
+    Workflow: Call with analyze=True first, generate summaries, then call
+    again with analyze=False for each candidate.
+
+    Args:
+        analyze: If True, return candidates. If False, apply compaction.
+        ember_id: (execute mode) The ember to compact.
+        compacted_content: (execute mode) The LLM-generated summary.
+        min_shadow_load: (analyze mode) Minimum shadow_load threshold.
+        min_age_days: (analyze mode) Minimum age in days.
+        limit: (analyze mode) Max candidates to return.
+    """
+    await _ensure_init()
+    await _reload_from_disk()
+
+    if analyze:
+        # --- Analyze mode: find compaction candidates ---
+        all_embers = await _storage.list_embers()
+        now = datetime.now(timezone.utc)
+        candidates = []
+
+        for e in all_embers:
+            if e.is_stale or e.is_compacted:
+                continue  # skip already stale or compacted
+
+            age_days = (now - e.created_at).total_seconds() / 86400.0
+            if age_days < min_age_days:
+                continue
+            if e.shadow_load < min_shadow_load:
+                continue
+
+            # Score: higher shadow_load + older age = better candidate
+            age_factor = min(age_days / 30.0, 3.0)  # cap at 3x
+            compaction_score = e.shadow_load * age_factor
+            candidates.append((e, compaction_score, age_days))
+
+        candidates.sort(key=lambda x: x[1], reverse=True)
+        candidates = candidates[:limit]
+
+        if not candidates:
+            return "No compaction candidates found matching criteria."
+
+        lines = [f"Found {len(candidates)} compaction candidate(s):\n"]
+        for e, score, age in candidates:
+            lines.append(
+                f"---\n"
+                f"ID: {e.ember_id}\n"
+                f"Name: {e.name}\n"
+                f"Shadow: {e.shadow_load:.2f} | Age: {int(age)}d | "
+                f"Score: {score:.2f} | Chars: {len(e.content)}\n"
+                f"Content:\n{e.content}\n"
+            )
+        lines.append(
+            "\n--- To compact, call ember_compact(analyze=False, "
+            "ember_id='...', compacted_content='your summary') for each."
+        )
+        return "\n".join(lines)
+
+    else:
+        # --- Execute mode: apply compaction ---
+        if not ember_id or not compacted_content:
+            return "Execute mode requires ember_id and compacted_content."
+
+        ember = await _storage.get_ember(ember_id)
+        if not ember:
+            return f"Ember {ember_id} not found."
+
+        if ember.is_compacted:
+            return f"Ember '{ember.name}' is already compacted."
+
+        original_length = len(ember.content)
+
+        # Update content and compaction fields
+        ember.content = compacted_content
+        ember.is_compacted = True
+        ember.original_content_length = original_length
+        ember.updated_at = datetime.now(timezone.utc)
+
+        # Re-embed the compacted content
+        new_vector = await _engine.embed(compacted_content)
+        new_cell_id = _engine.assign_cell(new_vector)
+        ember.cell_id = new_cell_id
+
+        # Update FAISS vector: remove old, add new with same integer ID
+        int_id = _storage.uuid_to_int.get(ember_id)
+        if int_id is not None:
+            await _engine.remove_vector(int_id)
+            await _engine.add_vector(int_id, new_vector)
+
+        # Save updated ember
+        await _storage.update_ember(ember)
+
+        reduction = round(
+            (1 - len(compacted_content) / original_length) * 100, 1
+        ) if original_length > 0 else 0
+        return (
+            f"Compacted '{ember.name}': {original_length} → "
+            f"{len(compacted_content)} chars ({reduction}% reduction). "
+            f"Vector re-embedded, edges preserved."
+        )
 
 
 @mcp.tool(annotations={"readOnlyHint": True, "destructiveHint": False, "openWorldHint": False})

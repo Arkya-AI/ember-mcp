@@ -26,6 +26,7 @@ class Ember(BaseModel):
     supersedes_id: Optional[str] = None
     is_stale: bool = False
     stale_reason: Optional[str] = None
+    status: Optional[str] = None  # None | open | in_progress | done
 
     # Access tracking
     last_accessed_at: Optional[datetime] = None
@@ -43,6 +44,10 @@ class Ember(BaseModel):
     related_ids: List[str] = Field(default_factory=list)  # KG edges (max 5)
     superseded_by_id: Optional[str] = None  # Reverse link from contradict
 
+    # Compaction tracking
+    is_compacted: bool = False
+    original_content_length: Optional[int] = None  # chars before compaction
+
     # Timestamps
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
@@ -58,6 +63,8 @@ class EmberMetadata(BaseModel):
     cell_id: int
     importance: str
     is_stale: bool
+    status: Optional[str] = None
+    is_compacted: bool = False
     created_at: datetime
 
     @classmethod
@@ -69,6 +76,8 @@ class EmberMetadata(BaseModel):
             cell_id=ember.cell_id,
             importance=ember.importance,
             is_stale=ember.is_stale,
+            status=ember.status,
+            is_compacted=ember.is_compacted,
             created_at=ember.created_at,
         )
 
@@ -136,3 +145,10 @@ DECAY_HALF_LIVES = {
     "context": 7.0,
     "learning": 90.0,
 }
+
+# Valid edge types for the knowledge graph
+VALID_EDGE_TYPES = {
+    "shadow", "related", "supersedes",        # system-managed
+    "depends_on", "child_of", "context_for",  # user-specifiable
+}
+USER_EDGE_TYPES = {"depends_on", "child_of", "context_for"}

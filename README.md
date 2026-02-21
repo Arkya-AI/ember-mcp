@@ -5,6 +5,8 @@
 ![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)
 ![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)
 
+<!-- mcp-name: io.github.timolabsai/ember-mcp -->
+
 Ember MCP is a Model Context Protocol server that provides LLMs with long-term memory without cloud dependencies. Unlike standard vector stores that simply retrieve the most similar chunks, Ember actively manages knowledge density and freshness to prevent the retrieval of obsolete information. If you built an authentication system using JWTs six months ago but migrated to OAuth last week, Ember ensures the AI suggests OAuth patterns, not the deprecated JWT code. When you dump months of meeting transcripts into the chat, it distinguishes between the feature requirements you set in January and the pivot you decided on in March. Best of all, this context follows you everywhere: debug a backend issue in Claude Desktop during the day, and continue refactoring the exact same context in Cursor at night.
 
 ## Key Features
@@ -98,12 +100,13 @@ You don't need to learn a new syntax or manage a "knowledge base." You just talk
 
 ## Tools
 
-Ember exposes **11 tools** to the LLM:
+Ember exposes **19 tools** to the LLM:
 
 | Tool | Description |
 |------|-------------|
-| `ember_store` | Save a named memory with importance level and optional tags |
+| `ember_store` | Save a named memory with importance level, optional tags, status, and typed graph edges |
 | `ember_recall` | Semantic search with temporal scoring across all memories |
+| `ember_read` | Read the full content of a specific ember by ID |
 | `ember_deep_recall` | Recall + automatically read source files behind the embers |
 | `ember_learn` | Auto-capture key information from conversation (facts, preferences, decisions) |
 | `ember_contradict` | Mark outdated memory stale and store corrected version |
@@ -113,6 +116,13 @@ Ember exposes **11 tools** to the LLM:
 | `ember_auto` | Auto-retrieve relevant context at conversation start with temporal ranking |
 | `ember_save_session` | Save session summary, decisions, and next steps with source linking |
 | `ember_drift_check` | Run drift detection — flag stale memories in shifting knowledge regions |
+| `ember_graph_search` | Vector search + BFS traversal via typed knowledge graph edges |
+| `ember_actionable` | List embers with active task status (open or in_progress) |
+| `ember_set_status` | Update the task status of an existing ember |
+| `ember_compact` | AI-powered compaction of stale/shadowed embers — analyze candidates or apply LLM-generated summary |
+| `ember_health` | Compute hallucination risk metrics across the memory store |
+| `ember_recompute_shadows` | Full recalculation of shadow_load for every ember |
+| `ember_explain` | Return HESTIA score breakdown for a specific ember |
 
 ## Prompts
 
@@ -151,4 +161,4 @@ To backup: copy the `~/.ember` directory.
 
 ## License
 
-MIT — Built by [Arkya AI](https://github.com/ArkyaAI)
+MIT — Built by [Timo Labs](https://github.com/TimoLabsAI)

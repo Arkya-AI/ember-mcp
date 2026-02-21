@@ -1,0 +1,19 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.timolabsai/ember-mcp",
+  "title": "Ember MCP",
+  "description": "Persistent semantic memory for LLM agents — powered by Shadow-Decay and HESTIA scoring. Stores, retrieves, and manages knowledge across sessions locally on-device.",
+  "version": "0.2.0",
+  "repository": {
+    "url": "https://github.com/TimoLabsAI/ember-mcp"
+  },
+  "websiteUrl": "https://ember.timolabs.dev",
+  "packages": [
+    {
+      "registryName": "pypi",
+      "name": "ember-mcp",
+      "version": "0.2.0",
+      "runtimeArguments": ["ember-mcp", "run"]
+    }
+  ]
+}
